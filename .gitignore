@@ -1,0 +1,13 @@
+# Ignore any files/directories with these names
+.DS_Store
+*.gguf
+
+# Ignore Python cache directories
+/__pycache__/
+.venv/
+
+# Ignore IDE and editor configuration files
+.vscode/
+.idea/
+.pycharm/
+
