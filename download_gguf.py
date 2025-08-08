@@ -114,7 +114,10 @@ def main():
             # This shouldn't happen given our validation above, but just in case
             print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Invalid model format for user-specific download.")
             sys.exit(1)
-    output_filename = f"{model_name}_{model_parameters}.gguf"
+    
+    # Generate safe filename by replacing slashes with underscores
+    safe_model_name = model_name.replace("/", "_")
+    output_filename = f"{safe_model_name}_{model_parameters}.gguf"
 
     print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading {output_filename} to {save_dir}...")
     filepath = download_file(download_url, output_filename, save_dir)
