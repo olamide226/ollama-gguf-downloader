@@ -89,6 +89,44 @@ For more information about using the script, you can use the --help or -h option
 python download_gguf.py --help
 ```
 
+## Development
+
+### Running Tests
+
+This project includes comprehensive unit tests to ensure reliability. To run the tests:
+
+1. Install development dependencies:
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+2. Run the test suite:
+   ```bash
+   # Run tests with coverage
+   python -m pytest test_download_gguf.py --cov=download_gguf --cov-report=term-missing -v
+   
+   # Or use the test runner script
+   python run_tests.py
+   ```
+
+3. View detailed coverage report:
+   ```bash
+   # Generate HTML coverage report
+   python -m pytest test_download_gguf.py --cov=download_gguf --cov-report=html
+   # Open htmlcov/index.html in your browser
+   ```
+
+### Test Structure
+
+The test suite covers:
+- ✅ Manifest fetching with library and user-specific fallbacks
+- ✅ Network error handling and timeouts
+- ✅ File download functionality
+- ✅ Directory creation and file operations
+- ✅ Filename sanitization for user-specific models
+- ✅ URL generation for different model types
+- ✅ Error handling for various failure scenarios
+
 ## Troubleshooting
 
 - **Model not found**: If you get a "Model not found in library" error, try using the user-specific format: `username/modelname`
