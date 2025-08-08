@@ -1,10 +1,10 @@
 import argparse
 import os
 import sys
-import requests
 
-from tqdm import tqdm
+import requests
 from colorama import Fore, Style
+from tqdm import tqdm
 
 
 def fetch_manifest(model_name, model_parameters):

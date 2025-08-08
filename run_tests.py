@@ -2,9 +2,9 @@
 """
 Test runner script for ollama-gguf-downloader
 """
+import os
 import subprocess
 import sys
-import os
 
 
 def run_tests():

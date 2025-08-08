@@ -1,13 +1,14 @@
-import unittest
-import os
-import tempfile
-import shutil
-from unittest.mock import patch, MagicMock, mock_open
-import requests
 import json
+import os
+import shutil
+import tempfile
+import unittest
+from unittest.mock import MagicMock, mock_open, patch
+
+import requests
 
 # Import the functions we want to test
-from download_gguf import fetch_manifest, download_file
+from download_gguf import download_file, fetch_manifest
 
 
 class TestFetchManifest(unittest.TestCase):
