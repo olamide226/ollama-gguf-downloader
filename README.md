@@ -15,8 +15,8 @@
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/gguf-downloader.git
-   cd gguf-downloader
+   https://github.com/olamide226/ollama-gguf-downloader
+   cd ollama-gguf-downloader
    ```
 
 2. (Optional but recommended) Create and activate a virtual environment:
