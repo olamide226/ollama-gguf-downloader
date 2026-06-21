@@ -78,9 +78,25 @@ def get_file_info(url):
 
     size = int(r.headers.get("content-length", 0))
 
-    supports_ranges = (
-        r.headers.get("accept-ranges", "").lower() == "bytes"
-    )
+    supports_ranges = False
+
+    try:
+        rr = requests.get(
+            url,
+            headers={"Range": "bytes=0-0"},
+            stream=True,
+            timeout=60,
+        )
+
+        supports_ranges = (
+            rr.status_code == 206
+            or "content-range" in rr.headers
+        )
+
+        rr.close()
+
+    except Exception:
+        pass
 
     return size, supports_ranges
 
@@ -130,16 +146,22 @@ def download_chunk(
         stream=True,
         timeout=300,
     ) as r:
-        r.raise_for_status()
+
+        if r.status_code not in (206,):
+            raise RuntimeError(
+                f"Server ignored Range request "
+                f"({r.status_code})"
+            )
 
         with open(part_file, "ab") as f:
-            for chunk in r.iter_content(1024 * 1024):
+            for chunk in r.iter_content(
+                1024 * 1024
+            ):
                 if not chunk:
                     continue
 
                 f.write(chunk)
                 progress.update(len(chunk))
-
 
 def merge_parts(
     output_file,
@@ -184,12 +206,7 @@ def download_large_file(
     output_file,
     workers=8,
 ):
-    total_size, supports_ranges = get_file_info(url)
-
-    if not supports_ranges:
-        raise RuntimeError(
-            "Server does not support range requests."
-        )
+    total_size, _ = get_file_info(url)
 
     if os.path.exists(output_file):
         existing_size = os.path.getsize(output_file)
