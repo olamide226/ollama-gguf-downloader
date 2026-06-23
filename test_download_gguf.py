@@ -7,9 +7,16 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import requests
 
-from download_gguf import (cleanup, download_chunk, download_file,
-                           download_large_file, fetch_manifest, get_blob_url,
-                           get_file_info, merge_parts)
+from download_gguf import (
+    cleanup,
+    download_chunk,
+    download_file,
+    download_large_file,
+    fetch_manifest,
+    get_blob_url,
+    get_file_info,
+    merge_parts,
+)
 
 
 class TestFetchManifest(unittest.TestCase):
