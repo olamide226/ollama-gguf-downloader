@@ -1,48 +1,57 @@
+#!/usr/bin/env python3
+
 import argparse
+import math
 import os
+import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from colorama import Fore, Style
+from colorama import Fore, Style, init
 from tqdm import tqdm
+
+init(autoreset=True)
+
+CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB per chunk for parallel downloads
 
 
 def fetch_manifest(model_name, model_parameters):
-    """Fetch the manifest for a model from the Ollama registry."""
-    # First try the standard library format
+    """Fetch the manifest for a model from the Ollama registry.
+
+    Returns (manifest_dict, source_type) where source_type is "library"
+    or the model name component for user-specific models.
+    """
     url = f"https://registry.ollama.ai/v2/library/{model_name}/manifests/{model_parameters}"
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()  # Raise an error for bad status codes
-        return response.json(), "library"
-    except requests.exceptions.HTTPError as e:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            return response.json(), "library"
         if response.status_code == 404:
-            print(
-                f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Model not found in library, trying user-specific format..."
-            )
-            # Try with user-specific format only if model_name contains a slash
             if "/" in model_name:
-                user, model = model_name.split("/", 1)
-                fallback_url = f"https://registry.ollama.ai/v2/{user}/{model}/manifests/{model_parameters}"
-                fallback_model_name = model
-
-                try:
-                    fallback_response = requests.get(fallback_url, timeout=10)
-                    fallback_response.raise_for_status()
-                    return fallback_response.json(), fallback_model_name
-                except requests.exceptions.RequestException as fallback_e:
-                    print(
-                        f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to fetch manifest from both library and user-specific formats: {fallback_e}"
-                    )
-                    sys.exit(1)
-            else:
                 print(
-                    f"{Fore.RED}[ERROR]{Style.RESET_ALL} Model not found in library. For user-specific models, use the format 'username/modelname'."
+                    f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} "
+                    "Model not found in library, trying user-specific format..."
                 )
-                sys.exit(1)
-        else:
-            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to fetch manifest: {e}")
+                user, model = model_name.split("/", 1)
+                fallback_url = (
+                    f"https://registry.ollama.ai/v2/{user}/{model}"
+                    f"/manifests/{model_parameters}"
+                )
+                fallback_response = requests.get(fallback_url, timeout=30)
+                fallback_response.raise_for_status()
+                return fallback_response.json(), model
+            print(
+                f"{Fore.RED}[ERROR]{Style.RESET_ALL} "
+                f"Model '{model_name}:{model_parameters}' not found in library. "
+                "For user-specific models, use 'username/modelname'."
+            )
             sys.exit(1)
+            return  # unreachable; placates mocked sys.exit in tests
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to fetch manifest: {e}")
+        sys.exit(1)
     except requests.exceptions.RequestException as e:
         print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to fetch manifest: {e}")
         sys.exit(1)
@@ -51,9 +60,37 @@ def fetch_manifest(model_name, model_parameters):
         sys.exit(1)
 
 
+def get_blob_url(model_name, digest, source_type):
+    """Build the blob download URL for a model."""
+    if source_type == "library":
+        return f"https://registry.ollama.ai/v2/library/{model_name}/blobs/{digest}"
+    user, model = model_name.split("/", 1)
+    return f"https://registry.ollama.ai/v2/{user}/{model}/blobs/{digest}"
+
+
+def get_file_info(url):
+    """Probe the server for file size and range-request support.
+
+    Returns (size_in_bytes, supports_ranges).
+    """
+    r = requests.head(url, allow_redirects=True, timeout=60)
+    r.raise_for_status()
+    size = int(r.headers.get("content-length", 0))
+
+    supports_ranges = False
+    try:
+        rr = requests.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=60)
+        supports_ranges = rr.status_code == 206 or "content-range" in rr.headers
+        rr.close()
+    except Exception:
+        pass
+
+    return size, supports_ranges
+
+
 def download_file(url, filename, save_dir):
     """Download a file from a URL and save it to a specified directory."""
-    os.makedirs(save_dir, exist_ok=True)  # Ensure directory exists
+    os.makedirs(save_dir, exist_ok=True)
     filepath = os.path.join(save_dir, filename)
 
     try:
@@ -83,6 +120,142 @@ def download_file(url, filename, save_dir):
     return filepath
 
 
+def download_chunk(url, part_file, start, end, progress):
+    """Download a single byte range and append to part_file. Resumes partial chunks."""
+    expected_size = end - start + 1
+    existing = 0
+
+    if os.path.exists(part_file):
+        existing = os.path.getsize(part_file)
+        if existing == expected_size:
+            progress.update(existing)
+            return
+        if existing > expected_size:
+            os.remove(part_file)
+            existing = 0
+
+    headers = {"Range": f"bytes={start + existing}-{end}"}
+    with requests.get(url, headers=headers, stream=True, timeout=300) as r:
+        if r.status_code != 206:
+            raise RuntimeError(f"Server ignored range request (HTTP {r.status_code})")
+        with open(part_file, "ab") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                progress.update(len(chunk))
+
+
+def merge_parts(output_file, parts_dir, chunk_count):
+    """Concatenate chunk files into the final output file atomically."""
+    temp_output = output_file + ".merging"
+    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Merging chunks...")
+    try:
+        with open(temp_output, "wb") as out:
+            for idx in range(chunk_count):
+                part_file = os.path.join(parts_dir, f"part_{idx:05d}")
+                with open(part_file, "rb") as inp:
+                    while True:
+                        data = inp.read(8 * 1024 * 1024)
+                        if not data:
+                            break
+                        out.write(data)
+        os.replace(temp_output, output_file)
+    except Exception:
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        raise
+
+
+def cleanup(parts_dir):
+    """Remove the temporary parts directory."""
+    if os.path.exists(parts_dir):
+        shutil.rmtree(parts_dir)
+
+
+def download_large_file(url, output_file, workers=4):
+    """Download a large file using parallel chunked range requests with resume support.
+
+    If the server does not support range requests, falls back to single-threaded download.
+    """
+    total_size, supports_ranges = get_file_info(url)
+
+    if not supports_ranges or workers <= 1:
+        print(
+            f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} "
+            "Server does not support range requests — using single-threaded download."
+        )
+        save_dir = os.path.dirname(output_file) or "."
+        filename = os.path.basename(output_file)
+        return download_file(url, filename, save_dir)
+
+    if os.path.exists(output_file) and os.path.getsize(output_file) == total_size:
+        print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} File already exists.")
+        return
+
+    parts_dir = output_file + ".parts"
+    os.makedirs(parts_dir, exist_ok=True)
+    chunk_count = math.ceil(total_size / CHUNK_SIZE)
+
+    # Pre-scan: count already-completed bytes for progress bar
+    completed_bytes = 0
+    for idx in range(chunk_count):
+        start = idx * CHUNK_SIZE
+        end = min(total_size - 1, start + CHUNK_SIZE - 1)
+        part_file = os.path.join(parts_dir, f"part_{idx:05d}")
+        if os.path.exists(part_file) and os.path.getsize(part_file) == end - start + 1:
+            completed_bytes += end - start + 1
+
+    progress = tqdm(
+        total=total_size,
+        initial=completed_bytes,
+        unit="B",
+        unit_scale=True,
+        desc="Downloading",
+    )
+
+    try:
+        futures = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for idx in range(chunk_count):
+                start = idx * CHUNK_SIZE
+                end = min(total_size - 1, start + CHUNK_SIZE - 1)
+                part_file = os.path.join(parts_dir, f"part_{idx:05d}")
+                if (
+                    os.path.exists(part_file)
+                    and os.path.getsize(part_file) == end - start + 1
+                ):
+                    continue
+                futures.append(
+                    executor.submit(
+                        download_chunk, url, part_file, start, end, progress
+                    )
+                )
+            for future in as_completed(futures):
+                future.result()
+    finally:
+        progress.close()
+
+    # Verify all chunks
+    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Verifying chunks...")
+    for idx in range(chunk_count):
+        start = idx * CHUNK_SIZE
+        end = min(total_size - 1, start + CHUNK_SIZE - 1)
+        part_file = os.path.join(parts_dir, f"part_{idx:05d}")
+        if not os.path.exists(part_file):
+            raise RuntimeError(f"Missing chunk: {part_file}")
+        actual_size = os.path.getsize(part_file)
+        expected_size = end - start + 1
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"Corrupt chunk {part_file}: {actual_size} != {expected_size}"
+            )
+
+    merge_parts(output_file, parts_dir, chunk_count)
+    cleanup(parts_dir)
+    print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Download complete.")
+
+
 def main():
     """Main function to process arguments and download a GGUF model."""
     parser = argparse.ArgumentParser(
@@ -100,18 +273,19 @@ def main():
         default=".",
         help="Directory to save the downloaded file (default: current directory)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel download workers (default: 4)",
+    )
 
     args = parser.parse_args()
 
-    model_name = args.model_name
-    model_parameters = args.model_parameters
-    save_dir = args.save_dir
-
-    manifest, actual_model_name = fetch_manifest(model_name, model_parameters)
+    manifest, source_type = fetch_manifest(args.model_name, args.model_parameters)
 
     layers = manifest.get("layers", [])
     model_digest = None
-
     for layer in layers:
         if layer.get("mediaType") == "application/vnd.ollama.image.model":
             model_digest = layer.get("digest")
@@ -121,34 +295,21 @@ def main():
         print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Model digest not found in manifest.")
         sys.exit(1)
 
-    # Use the appropriate URL format based on what worked for the manifest
-    if actual_model_name == "library":
-        download_url = (
-            f"https://registry.ollama.ai/v2/library/{model_name}/blobs/{model_digest}"
-        )
-    else:
-        # For user-specific models, model_name should contain a slash
-        if "/" in model_name:
-            user, model = model_name.split("/", 1)
-            download_url = (
-                f"https://registry.ollama.ai/v2/{user}/{model}/blobs/{model_digest}"
-            )
-        else:
-            # This shouldn't happen given our validation above, but just in case
-            print(
-                f"{Fore.RED}[ERROR]{Style.RESET_ALL} Invalid model format for user-specific download."
-            )
-            sys.exit(1)
-
-    # Generate safe filename by replacing slashes with underscores
-    safe_model_name = model_name.replace("/", "_")
-    output_filename = f"{safe_model_name}_{model_parameters}.gguf"
-
-    print(
-        f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading {output_filename} to {save_dir}..."
+    download_url = get_blob_url(args.model_name, model_digest, source_type)
+    safe_model_name = args.model_name.replace("/", "_")
+    output_file = os.path.join(
+        args.save_dir, f"{safe_model_name}_{args.model_parameters}.gguf"
     )
-    filepath = download_file(download_url, output_filename, save_dir)
-    print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Download completed: {filepath}")
+
+    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Saved to: {output_file}")
+
+    if args.workers > 1:
+        download_large_file(download_url, output_file, workers=args.workers)
+    else:
+        filename = os.path.basename(output_file)
+        save_dir = os.path.dirname(output_file) or "."
+        filepath = download_file(download_url, filename, save_dir)
+        print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Download completed: {filepath}")
 
 
 if __name__ == "__main__":
